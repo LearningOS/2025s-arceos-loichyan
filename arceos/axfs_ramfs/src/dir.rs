@@ -165,12 +165,35 @@ impl VfsNodeOps for DirNode {
         }
     }
 
+    fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
+        log::debug!("rename at ramfs: {} -> {}", src_path, dst_path);
+
+        let src_file = rsplit_path(src_path).1;
+        // NOTE: The directory of `dst_path` is actually ignored, because we
+        // cannot determine whether it is an absolute path or a relative path.
+        let dst_file = rsplit_path(dst_path).1;
+
+        let src_node = self
+            .children
+            .write()
+            .remove(src_file)
+            .ok_or(VfsError::NotFound)?;
+        self.children.write().insert(dst_file.into(), src_node);
+
+        Ok(())
+    }
+
     axfs_vfs::impl_vfs_dir_default! {}
 }
 
 fn split_path(path: &str) -> (&str, Option<&str>) {
-    let trimmed_path = path.trim_start_matches('/');
-    trimmed_path.find('/').map_or((trimmed_path, None), |n| {
-        (&trimmed_path[..n], Some(&trimmed_path[n + 1..]))
-    })
+    let path = path.trim_start_matches('/');
+    path.split_once('/')
+        .map_or((path, None), |(p1, p2)| (p1, Some(p2)))
+}
+
+fn rsplit_path(path: &str) -> (Option<&str>, &str) {
+    let path = path.trim_start_matches('/');
+    path.rsplit_once('/')
+        .map_or((None, path), |(p1, p2)| (Some(p1), p2))
 }
