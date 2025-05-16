@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use core::ffi::{c_void, c_char, c_int};
-use axhal::arch::TrapFrame;
-use axhal::trap::{register_trap_handler, SYSCALL};
-use axerrno::LinuxError;
-use axtask::current;
-use axtask::TaskExtRef;
-use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use axerrno::LinuxError;
+use axhal::arch::TrapFrame;
+use axhal::paging::MappingFlags;
+use axhal::trap::{register_trap_handler, SYSCALL};
+use axtask::{current, TaskExtRef};
+use core::ffi::{c_char, c_int, c_void};
+use memory_addr::{AddrRange, MemoryAddr, VirtAddr};
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -45,7 +45,7 @@ macro_rules! syscall_body {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Clone, Copy, Debug)]
     /// permissions for sys_mmap
     ///
     /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
@@ -76,7 +76,7 @@ impl From<MmapProt> for MappingFlags {
 }
 
 bitflags::bitflags! {
-    #[derive(Debug)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     /// flags for sys_mmap
     ///
     /// See <https://github.com/bminor/glibc/blob/master/bits/mman.h>
@@ -99,10 +99,15 @@ bitflags::bitflags! {
 #[register_trap_handler(SYSCALL)]
 fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ax_println!("handle_syscall [{}] ...", syscall_num);
-    let ret = match syscall_num {
-         SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
+    match syscall_num {
+        SYS_IOCTL => sys_ioctl(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _) as _,
         SYS_SET_TID_ADDRESS => sys_set_tid_address(tf.arg0() as _),
-        SYS_OPENAT => sys_openat(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _, tf.arg3() as _),
+        SYS_OPENAT => sys_openat(
+            tf.arg0() as _,
+            tf.arg1() as _,
+            tf.arg2() as _,
+            tf.arg3() as _,
+        ),
         SYS_CLOSE => sys_close(tf.arg0() as _),
         SYS_READ => sys_read(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
         SYS_WRITE => sys_write(tf.arg0() as _, tf.arg1() as _, tf.arg2() as _),
@@ -126,9 +131,8 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
         _ => {
             ax_println!("Unimplemented syscall: {}", syscall_num);
             -LinuxError::ENOSYS.code() as _
-        }
-    };
-    ret
+        },
+    }
 }
 
 #[allow(unused_variables)]
@@ -138,9 +142,67 @@ fn sys_mmap(
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        use LinuxError::*;
+
+        let addr = VirtAddr::from_mut_ptr_of(addr);
+        if !addr.is_aligned_4k() || length == 0 {
+            return Err(EINVAL);
+        }
+        let Some(prot) = MmapProt::from_bits(prot) else {
+            return Err::<isize, _>(EINVAL);
+        };
+        let Some(flags) = MmapFlags::from_bits(flags) else {
+            return Err(EINVAL);
+        };
+        if prot.contains(MmapProt::PROT_WRITE) {
+            panic!("PROT_WRITE is not supported yet");
+        }
+        if flags != MmapFlags::MAP_PRIVATE {
+            panic!("only MAP_PRIVATE is supported for now");
+        }
+        if offset != 0 {
+            panic!("`offset` is not supported yet");
+        }
+
+        let task = axtask::current();
+        let task_ext = task.task_ext();
+        let mut uspace = task_ext.aspace.lock();
+        let addr = uspace
+            .find_free_area(
+                addr,
+                length,
+                AddrRange::new(addr, VirtAddr::from(0x40_0000_0000)),
+            )
+            .ok_or(ENOMEM)?;
+        uspace.map_alloc(
+            addr,
+            length.align_up_4k(),
+            MappingFlags::from(prot) | MappingFlags::WRITE,
+            true,
+        )?;
+
+        let file = api::get_file_like(fd)?;
+        let mut buf = [0u8; 64];
+        let mut ptr = addr.as_mut_ptr();
+        loop {
+            let n = file.read(&mut buf)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, n);
+            }
+            if n == 0 {
+                break;
+            }
+            ptr = ptr.wrapping_add(n);
+        }
+
+        uspace.protect(addr, length.align_up_4k(), MappingFlags::from(prot))?;
+        drop(uspace);
+
+        Ok(addr.as_usize() as isize)
+    })
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
