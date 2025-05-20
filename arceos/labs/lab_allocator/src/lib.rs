@@ -7,17 +7,26 @@ use allocator::{AllocError, AllocResult, BaseAllocator, ByteAllocator};
 use core::alloc::Layout;
 use core::ptr::NonNull;
 
+mod bitmap;
+use bitmap::Bitmap;
+
+mod chunk_decoder;
+use chunk_decoder::ChunkDecoder;
+
+const BLOCK_SIZE: usize = 256;
+const USIZE_BITS: usize = usize::BITS as usize;
+
 pub struct LabByteAllocator {
     chunks: ChunkList,
     stat: AllocatorStat,
-    last_pos: isize,
+    side: isize,
 }
 
 unsafe impl Send for LabByteAllocator {}
 
 struct AllocatorStat {
     total_bytes: usize,
-    used_bytes: usize,
+    avail_bytes: usize,
 }
 
 impl LabByteAllocator {
@@ -27,9 +36,9 @@ impl LabByteAllocator {
             chunks: ChunkList::new(),
             stat: AllocatorStat {
                 total_bytes: 0,
-                used_bytes: 0,
+                avail_bytes: 0,
             },
-            last_pos: 1,
+            side: 1,
         }
     }
 }
@@ -52,41 +61,29 @@ impl BaseAllocator for LabByteAllocator {
 
 impl ByteAllocator for LabByteAllocator {
     fn alloc(&mut self, layout: Layout) -> AllocResult<NonNull<u8>> {
-        if layout.align() != 1 || !(layout.size() & !0x3ff).is_power_of_two() {
+        // Since bytes are allocated and freed alternately, if we allocate the
+        // required layout alternately on both sides, the deallocated blocks
+        // will likely be in a continuous region. This would significantly
+        // reduce external fragmentation.
+        self.side = -self.side;
+        if self.side < 0 {
             self.chunks
                 .iter_mut()
-                .find(|c| c.fits_right(layout).is_some())
-                .ok_or(AllocError::NoMemory)?
-                .alloc_right(&mut self.stat, layout)
+                .find_map(|c| c.alloc_left(&mut self.stat, layout))
         } else {
-            self.last_pos = -self.last_pos;
-            if self.last_pos < 0 {
-                self.chunks
-                    .iter_mut()
-                    .find(|c| c.fits_right(layout).is_some())
-                    .ok_or(AllocError::NoMemory)?
-                    .alloc_right(&mut self.stat, layout)
-            } else {
-                self.chunks
-                    .iter_mut()
-                    .filter(|c| c.fits_left(layout).is_some())
-                    .last()
-                    .ok_or(AllocError::NoMemory)?
-                    .alloc_left(&mut self.stat, layout)
-            }
+            self.chunks
+                .iter_mut()
+                .find_map(|c| c.alloc_right(&mut self.stat, layout))
         }
-        .ok_or_else(|| unreachable!())
+        .ok_or(AllocError::NoMemory)
     }
 
     fn dealloc(&mut self, pos: NonNull<u8>, layout: Layout) {
-        let ptr = pos.as_ptr();
         self.chunks
             .iter_mut()
-            .find(|c| c.contains(ptr, layout))
+            .find_map(|c| c.dealloc(&mut self.stat, pos.as_ptr(), layout))
             .ok_or(AllocError::NotAllocated)
-            .unwrap()
-            .dealloc(&mut self.stat, ptr, layout)
-            .unwrap_or_else(|| unreachable!());
+            .unwrap();
     }
 
     fn total_bytes(&self) -> usize {
@@ -94,11 +91,11 @@ impl ByteAllocator for LabByteAllocator {
     }
 
     fn used_bytes(&self) -> usize {
-        self.stat.used_bytes
+        self.stat.total_bytes - self.stat.avail_bytes
     }
 
     fn available_bytes(&self) -> usize {
-        self.total_bytes() - self.used_bytes()
+        self.stat.avail_bytes
     }
 }
 
@@ -115,8 +112,13 @@ struct ChunkFooter {
     /// pointer to the footer itself as the end pointer of the entire memory
     /// chunk.
     start: *mut u8,
-    pos: *mut u8,
-    count: usize,
+    bitmap: Bitmap<'static>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Chunk {
+    pos: usize,
+    len: usize,
 }
 
 impl ChunkList {
@@ -131,21 +133,57 @@ impl ChunkList {
         size: usize,
     ) -> AllocResult {
         let start = start.as_ptr();
+        let end = start.wrapping_byte_add(size);
 
-        let end = floor_ptr(
-            start.wrapping_byte_add(size - ChunkFooter::SIZE),
-            ChunkFooter::ALIGN,
-        );
-        if end < start {
+        let blocks_start = ceil_ptr(start, BLOCK_SIZE);
+        let bitmap_ptr = {
+            let layout = Layout::array::<usize>(size / BLOCK_SIZE / 2).unwrap();
+            floor_ptr(end.wrapping_byte_sub(layout.size()), layout.align())
+        };
+        let footer_ptr = {
+            let layout = Layout::new::<ChunkFooter>();
+            floor_ptr(bitmap_ptr.wrapping_byte_sub(layout.size()), layout.align())
+        };
+
+        if footer_ptr < blocks_start {
             return Err(AllocError::NoMemory);
         }
 
-        let chunk_ptr = end.cast::<ChunkFooter>();
-        unsafe { chunk_ptr.write(ChunkFooter::new(self.0, start)) };
-        self.0 = NonNull::new(chunk_ptr);
+        let blocks_end = floor_ptr(footer_ptr, BLOCK_SIZE);
+        let blocks_size = bytes_between(blocks_start, blocks_end);
+        let blocks_count = blocks_size / BLOCK_SIZE;
+        let bitmap_len = blocks_count.div_ceil(USIZE_BITS);
+
+        unsafe {
+            let mut bitmap = Bitmap::new(core::slice::from_raw_parts_mut(
+                bitmap_ptr.cast(),
+                bitmap_len,
+            ));
+            bitmap.clear();
+
+            // Protect overflowing blocks
+            let total_count = bitmap_len * USIZE_BITS;
+            let count_diff = total_count - blocks_count;
+            if count_diff != 0 {
+                bitmap.set(blocks_count, count_diff)
+            }
+
+            let footer_ptr = footer_ptr.cast::<ChunkFooter>();
+            footer_ptr.write(ChunkFooter {
+                prev: self.0,
+                start: blocks_start,
+                bitmap,
+            });
+            self.0 = NonNull::new(footer_ptr);
+        }
 
         stat.total_bytes += size;
-        stat.used_bytes += size - bytes_between(start, end);
+        stat.avail_bytes += blocks_size;
+
+        log::info!(
+            "added memory region: blocks({blocks_start:?}, {blocks_count}) total_bytes({}KB)",
+            stat.total_bytes / 1024
+        );
 
         Ok(())
     }
@@ -163,107 +201,74 @@ impl ChunkList {
 }
 
 impl ChunkFooter {
-    const ALIGN: usize = align_of::<Self>();
-    const SIZE: usize = size_of::<Self>();
-
-    const fn new(prev: ChunkPtr, start: *mut u8) -> Self {
-        Self {
-            prev,
-            start,
-            pos: start,
-            count: 0,
-        }
-    }
-
     const fn end(&self) -> *const u8 {
         core::ptr::from_ref(self).cast()
     }
 
-    fn fits_left(&self, layout: Layout) -> Option<(*mut u8, *mut Self)> {
-        let data_ptr = ceil_ptr(self.pos, layout.align());
-        let chunk_ptr = ceil_ptr(data_ptr.wrapping_byte_add(layout.size()), Self::ALIGN);
-        if chunk_ptr.wrapping_byte_add(Self::SIZE).cast_const() > self.end() {
-            None
-        } else {
-            Some((data_ptr, chunk_ptr.cast()))
-        }
-    }
-
     fn alloc_left(&mut self, stat: &mut AllocatorStat, layout: Layout) -> Option<NonNull<u8>> {
-        let (data_ptr, chunk_ptr) = self.fits_left(layout)?;
-        let data_end = data_ptr.wrapping_byte_add(layout.size());
-        let chunk_end = chunk_ptr.wrapping_byte_add(Self::SIZE).cast::<u8>();
-
-        unsafe {
-            chunk_ptr.write(Self {
-                pos: data_end,
-                count: self.count + 1,
-                ..Self::new(self.prev, self.start)
-            });
-        }
-
-        stat.used_bytes += bytes_between(self.pos, chunk_end);
-        self.prev = NonNull::new(chunk_ptr);
-        self.start = chunk_end;
-        self.pos = chunk_end;
-        self.count = 0;
-
-        NonNull::new(data_ptr)
-    }
-
-    fn fits_right(&self, layout: Layout) -> Option<(*mut Self, *mut u8)> {
-        let data_ptr = floor_ptr(
-            self.end().wrapping_byte_sub(layout.size()).cast_mut(),
-            layout.align(),
-        );
-        let chunk_ptr = floor_ptr(data_ptr.wrapping_byte_sub(Self::SIZE), Self::ALIGN);
-        if chunk_ptr < self.pos {
-            None
-        } else {
-            Some((chunk_ptr.cast(), data_ptr))
-        }
+        let ptr = self
+            .bitmap
+            .decode()
+            .find_map(|c| c.fits_left(self.start, layout))?;
+        self.alloc_at(ptr.as_ptr(), stat, layout);
+        // log::info!("  ALLOC ptr={ptr:#x?} pos={}, len={len}", chunk.pos);
+        Some(ptr)
     }
 
     fn alloc_right(&mut self, stat: &mut AllocatorStat, layout: Layout) -> Option<NonNull<u8>> {
-        let (chunk_ptr, data_ptr) = self.fits_right(layout)?;
-        let data_end = data_ptr.wrapping_byte_add(layout.size());
-        let chunk_end = chunk_ptr.wrapping_byte_add(Self::SIZE).cast::<u8>();
-
-        unsafe {
-            chunk_ptr.write(core::ptr::from_ref(self).read());
-        }
-
-        stat.used_bytes += bytes_between(chunk_ptr, data_end);
-        self.prev = NonNull::new(chunk_ptr);
-        self.start = chunk_end;
-        self.pos = data_end;
-        self.count = 1;
-
-        NonNull::new(data_ptr)
+        let ptr = self
+            .bitmap
+            .decode()
+            .filter_map(|c| c.fits_right(self.start, layout))
+            .last()?;
+        self.alloc_at(ptr.as_ptr(), stat, layout);
+        // log::info!("  ALLOC ptr={ptr:#x?} pos={}, len={len}", chunk.pos);
+        Some(ptr)
     }
 
-    fn contains(&self, ptr: *mut u8, layout: Layout) -> bool {
-        ptr >= self.start && ptr.wrapping_byte_add(layout.size()).cast_const() <= self.pos
+    fn alloc_at(&mut self, ptr: *mut u8, stat: &mut AllocatorStat, layout: Layout) {
+        let start = bytes_between(self.start, ptr) / BLOCK_SIZE;
+        let end =
+            bytes_between(self.start, ptr.wrapping_byte_add(layout.size())).div_ceil(BLOCK_SIZE);
+        let len = end - start;
+        self.bitmap.set(start, len);
+        stat.avail_bytes -= len * BLOCK_SIZE;
     }
 
     fn dealloc(&mut self, stat: &mut AllocatorStat, ptr: *mut u8, layout: Layout) -> Option<()> {
-        if !self.contains(ptr, layout) {
+        if ptr < self.start || ptr.cast_const() > self.end() {
             return None;
         }
-        self.count -= 1;
-        if self.count != 0 {
-            return Some(());
-        }
-
-        if let Some(prev) = self.prev {
-            stat.used_bytes -= bytes_between(prev.as_ptr(), self.pos);
-            *self = unsafe { prev.read() };
-        } else {
-            stat.used_bytes -= bytes_between(self.start, self.pos);
-            self.pos = self.start;
-        }
-
+        let pos = bytes_between(self.start, ptr) / BLOCK_SIZE;
+        let len = layout.size().div_ceil(BLOCK_SIZE);
+        self.bitmap.unset(pos, len);
+        stat.avail_bytes += len * BLOCK_SIZE;
+        // log::info!("DEALLOC ptr={ptr:#x?} pos={pos}, len={len}");
         Some(())
+    }
+}
+
+impl Chunk {
+    fn fits_left(&self, start: *mut u8, layout: Layout) -> Option<NonNull<u8>> {
+        let start = start.wrapping_byte_add(self.pos * BLOCK_SIZE);
+        let end = start.wrapping_byte_add(self.len * BLOCK_SIZE);
+        let data_start = ceil_ptr(start, layout.align());
+        if data_start.wrapping_byte_add(layout.size()) > end {
+            None
+        } else {
+            Some(NonNull::new(data_start).unwrap())
+        }
+    }
+
+    fn fits_right(&self, start: *mut u8, layout: Layout) -> Option<NonNull<u8>> {
+        let start = start.wrapping_byte_add(self.pos * BLOCK_SIZE);
+        let end = start.wrapping_byte_add(self.len * BLOCK_SIZE);
+        let data_start = floor_ptr(end.wrapping_byte_sub(layout.size()), layout.align());
+        if data_start < start {
+            None
+        } else {
+            Some(NonNull::new(data_start).unwrap())
+        }
     }
 }
 
