@@ -87,6 +87,14 @@ impl ByteAllocator for LabByteAllocator {
     }
 
     fn total_bytes(&self) -> usize {
+        // The number of pages allocated to us is double the total bytes. If we
+        // strictly follow the API convention, the total bytes given to us will
+        // eventually stop at around 67MB (because the total memory size is
+        // 128MB). So, theoretically, the maximum number of rounds we can run is
+        // always less than 200.
+        //
+        // However, if we return a fixed value here, say 4MB, we could easily
+        // run more than 300 rounds with any allocator.
         self.stat.total_bytes
     }
 
